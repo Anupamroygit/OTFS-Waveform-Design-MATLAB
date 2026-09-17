@@ -1,0 +1,907 @@
+clc;
+clear;
+close all;
+tic;
+
+%% ================================================================
+% OTFS SYSTEM PARAMETERS
+% ================================================================
+
+N = 32;                         % Doppler bins / time slots
+M = 64;                         % Delay bins / subcarriers
+
+M_mod = 2;                      % BPSK
+M_bits = log2(M_mod);
+
+B = 4e3;                        % System bandwidth
+delta_f = B/M;                  % Subcarrier spacing
+T = 1/delta_f;                  % Symbol duration
+
+fs = M*delta_f;                 % Original sampling frequency
+
+N_syms_perfram = N*M;
+N_bits_perfram = N_syms_perfram*M_bits;
+
+SNR_dB = 0:5:20;
+SNR = 10.^(SNR_dB/10);
+
+N_fram = 5;
+
+rng(1);
+
+%% ================================================================
+% CHANNEL PARAMETERS
+% ================================================================
+
+taps = 6;
+
+% Integer delay taps
+max_delay = 8;
+
+% Doppler bins
+max_doppler_bin = 4;
+
+% Approximately uniform random delay/Doppler distribution
+
+%% ================================================================
+% SINC PARAMETERS
+% ================================================================
+
+OSF = 4;                       % Oversampling factor
+sinc_half_width = 8;           % Interpolation kernel half-width
+
+%% ================================================================
+% BER STORAGE
+% ================================================================
+
+err_ber = zeros(length(SNR_dB),1);
+
+%% ================================================================
+% VISUALIZATION STORAGE
+% ================================================================
+
+tx_DD_plot = [];
+rx_DD_plot = [];
+
+tx_TF_plot = [];
+rx_TF_plot = [];
+
+channel_delay_plot = [];
+channel_doppler_plot = [];
+
+%% ================================================================
+% SNR LOOP
+% ================================================================
+
+for iesn0 = 1:length(SNR_dB)
+
+    fprintf('\nSNR = %d dB\n',SNR_dB(iesn0));
+
+    for ifram = 1:N_fram
+
+        %% ========================================================
+        % RANDOM INFORMATION BITS
+        % =========================================================
+
+        data_info_bit = randi( ...
+            [0 1], ...
+            N_bits_perfram, ...
+            1);
+
+        % Convert bits to decimal symbols
+        data_temp = bi2de( ...
+            reshape( ...
+            data_info_bit, ...
+            M_bits, ...
+            []).', ...
+            'left-msb');
+
+        % BPSK modulation
+        x = qammod( ...
+            data_temp, ...
+            M_mod, ...
+            'gray');
+
+        % DD-domain symbol matrix
+        X_DD = reshape(x,N,M);
+
+        %% ========================================================
+        % OTFS MODULATION
+        % =========================================================
+
+        % ISFFT
+        X_TF = fft(ifft(X_DD).').'/sqrt(M/N);
+
+        % Heisenberg transform
+        s_mat = ifft(X_TF.')*sqrt(M);
+
+        % Serial time-domain samples
+        s = s_mat(:);
+
+        %% ========================================================
+        % SAVE TRANSMITTED SIGNALS
+        % =========================================================
+
+        if iesn0 == 1 && ifram == 1
+
+            tx_DD_plot = abs(X_DD);
+            tx_TF_plot = abs(X_TF);
+
+        end
+
+        %% ========================================================
+        % SINC INTERPOLATION
+        % =========================================================
+
+        s_os = sinc_interpolate( ...
+            s, ...
+            OSF, ...
+            sinc_half_width);
+
+        %% ========================================================
+        % RANDOM MULTIPATH CHANNEL
+        % =========================================================
+
+        % Random approximately uniformly distributed delay taps
+        delay_taps = randi( ...
+            [0 max_delay], ...
+            taps, ...
+            1);
+
+        % Random approximately uniformly distributed Doppler bins
+        Doppler_taps = randi( ...
+            [-max_doppler_bin max_doppler_bin], ...
+            taps, ...
+            1);
+
+        % Convert Doppler bins to Hz
+        Doppler_Hz = Doppler_taps/(N*T);
+
+        % Power delay profile
+        pdp_dB = linspace(0,-8,taps);
+
+        pow_prof = 10.^(pdp_dB/10);
+        pow_prof = pow_prof/sum(pow_prof);
+
+        % Complex Rayleigh fading coefficients
+        chan_coef = sqrt(pow_prof(:)).* ...
+            (randn(taps,1)+1i*randn(taps,1))/sqrt(2);
+
+        %% ========================================================
+        % SAVE CHANNEL INFORMATION
+        % =========================================================
+
+        if iesn0 == 1 && ifram == 1
+
+            channel_delay_plot = delay_taps;
+            channel_doppler_plot = Doppler_taps;
+
+        end
+
+        %% ========================================================
+        % MULTIPATH CHANNEL
+        % =========================================================
+
+        L = length(s_os);
+
+        max_delay_os = max(delay_taps)*OSF;
+
+        % Allocate enough room for delayed paths
+        channel_length = L + max_delay_os;
+
+        s_chan = zeros(channel_length,1);
+
+        t_os = (0:channel_length-1).'/(fs*OSF);
+
+        for tap_no = 1:taps
+
+            delay_os = delay_taps(tap_no)*OSF;
+
+            delayed_signal = zeros(channel_length,1);
+
+            if delay_os == 0
+
+                delayed_signal(1:L) = s_os;
+
+            elseif delay_os < channel_length
+
+                delayed_signal( ...
+                    delay_os+1: ...
+                    delay_os+L) = s_os;
+
+            end
+
+            % Doppler phase
+            doppler_phase = exp( ...
+                1i*2*pi*Doppler_Hz(tap_no)*t_os);
+
+            % Multipath contribution
+            s_chan = s_chan + ...
+                chan_coef(tap_no).* ...
+                delayed_signal.* ...
+                doppler_phase;
+
+        end
+
+        %% ========================================================
+        % AWGN
+        % =========================================================
+
+        signal_power = mean(abs(s_chan).^2);
+
+        if signal_power < 1e-12
+            signal_power = 1;
+        end
+
+        noise_power = signal_power/SNR(iesn0);
+
+        noise = sqrt(noise_power/2)* ...
+            (randn(size(s_chan))+ ...
+             1i*randn(size(s_chan)));
+
+        r_os = s_chan + noise;
+
+        %% ========================================================
+        % SINC RECONSTRUCTION
+        % =========================================================
+
+        % Reconstruct original sampling grid
+        r_full = sinc_decimate( ...
+            r_os, ...
+            OSF, ...
+            sinc_half_width);
+
+        %% ========================================================
+        % EXTRACT ORIGINAL OTFS FRAME
+        % =========================================================
+
+        % The useful signal occupies the first N*M original samples.
+        % Make the vector length exactly N*M.
+
+        if length(r_full) >= N*M
+
+            r = r_full(1:N*M);
+
+        else
+
+            r = zeros(N*M,1);
+            r(1:length(r_full)) = r_full;
+
+        end
+
+        %% ========================================================
+        % OTFS DEMODULATION
+        % =========================================================
+
+        r_mat = reshape(r,M,N);
+
+        % Wigner transform
+        Y = fft(r_mat)/sqrt(M);
+
+        Y = Y.';
+
+        % SFFT
+        y = ifft(fft(Y).').'/sqrt(N/M);
+
+        %% ========================================================
+        % SAVE RECEIVED SIGNALS
+        % =========================================================
+
+        if iesn0 == 1 && ifram == 1
+
+            rx_DD_plot = abs(y);
+            rx_TF_plot = abs(Y);
+
+        end
+
+        %% ========================================================
+        % MESSAGE PASSING DETECTOR
+        % =========================================================
+
+        yv = reshape(y,N*M,1);
+
+        n_ite = 50;
+        delta_fra = 0.6;
+
+        alphabet = qammod( ...
+            0:M_mod-1, ...
+            M_mod, ...
+            'gray');
+
+        mean_int = zeros(N*M,taps);
+        var_int = zeros(N*M,taps);
+
+        p_map = ones(N*M,taps,M_mod)/M_mod;
+
+        conv_rate_prev = -1;
+
+        % Default probability in case convergence does not occur
+        sum_prob_fin = p_map(:,:,1);
+
+        for ite = 1:n_ite
+
+            %% ====================================================
+            % COMPUTE INTERFERENCE STATISTICS
+            % =====================================================
+
+            for ele1 = 1:M
+
+                for ele2 = 1:N
+
+                    mean_int_hat = zeros(taps,1);
+                    var_int_hat = zeros(taps,1);
+
+                    for tap_no = 1:taps
+
+                        delay_value = delay_taps(tap_no);
+                        doppler_value = Doppler_taps(tap_no);
+
+                        m = ele1-1-delay_value+1;
+
+                        add_term = exp( ...
+                            1i*2*pi/M * ...
+                            (m-1)* ...
+                            (doppler_value/N));
+
+                        add_term1 = 1;
+
+                        if ele1-1 < delay_value
+
+                            n_idx = mod( ...
+                                ele2-1-doppler_value, ...
+                                N)+1;
+
+                            add_term1 = exp( ...
+                                -1i*2*pi*(n_idx-1)/N);
+
+                        end
+
+                        new_chan = ...
+                            add_term* ...
+                            add_term1* ...
+                            chan_coef(tap_no);
+
+                        for i2 = 1:M_mod
+
+                            p_current = ...
+                                p_map( ...
+                                N*(ele1-1)+ele2, ...
+                                tap_no, ...
+                                i2);
+
+                            mean_int_hat(tap_no) = ...
+                                mean_int_hat(tap_no)+ ...
+                                p_current*alphabet(i2);
+
+                            var_int_hat(tap_no) = ...
+                                var_int_hat(tap_no)+ ...
+                                p_current*abs(alphabet(i2))^2;
+
+                        end
+
+                        mean_int_hat(tap_no) = ...
+                            mean_int_hat(tap_no)*new_chan;
+
+                        var_int_hat(tap_no) = ...
+                            var_int_hat(tap_no)* ...
+                            abs(new_chan)^2;
+
+                        var_int_hat(tap_no) = ...
+                            max( ...
+                            var_int_hat(tap_no)- ...
+                            abs(mean_int_hat(tap_no))^2, ...
+                            1e-12);
+
+                    end
+
+                    mean_int_sum = sum(mean_int_hat);
+
+                    var_int_sum = ...
+                        sum(var_int_hat)+noise_power;
+
+                    for tap_no = 1:taps
+
+                        index_current = ...
+                            N*(ele1-1)+ele2;
+
+                        mean_int( ...
+                            index_current, ...
+                            tap_no) = ...
+                            mean_int_sum- ...
+                            mean_int_hat(tap_no);
+
+                        var_int( ...
+                            index_current, ...
+                            tap_no) = ...
+                            max( ...
+                            var_int_sum- ...
+                            var_int_hat(tap_no), ...
+                            1e-12);
+
+                    end
+
+                end
+
+            end
+
+            %% ====================================================
+            % MESSAGE PROBABILITY UPDATE
+            % =====================================================
+
+            sum_prob_comp = zeros(N*M,M_mod);
+
+            dum_eff_ele1 = zeros(taps,1);
+            dum_eff_ele2 = zeros(taps,1);
+
+            for ele1 = 1:M
+
+                for ele2 = 1:N
+
+                    log_te_var = zeros(taps,M_mod);
+
+                    for tap_no = 1:taps
+
+                        delay_value = delay_taps(tap_no);
+                        doppler_value = Doppler_taps(tap_no);
+
+                        % Delay index
+                        eff_ele1 = ...
+                            mod(ele1-1+delay_value,M)+1;
+
+                        % Doppler index
+                        eff_ele2 = ...
+                            mod(ele2-1+doppler_value,N)+1;
+
+                        % Phase term
+                        add_term = exp( ...
+                            1i*2*pi/M* ...
+                            (ele1-1)* ...
+                            (doppler_value/N));
+
+                        add_term1 = 1;
+
+                        if ele1-1+delay_value >= M
+
+                            add_term1 = exp( ...
+                                -1i*2*pi*(ele2-1)/N);
+
+                        end
+
+                        new_chan = ...
+                            add_term* ...
+                            add_term1* ...
+                            chan_coef(tap_no);
+
+                        dum_eff_ele1(tap_no) = eff_ele1;
+                        dum_eff_ele2(tap_no) = eff_ele2;
+
+                        index_eff = ...
+                            N*(eff_ele1-1)+eff_ele2;
+
+                        variance = max( ...
+                            var_int(index_eff,tap_no), ...
+                            1e-12);
+
+                        for i2 = 1:M_mod
+
+                            residual = ...
+                                yv(index_eff)- ...
+                                mean_int(index_eff,tap_no)- ...
+                                new_chan*alphabet(i2);
+
+                            log_te_var(tap_no,i2) = ...
+                                -abs(residual)^2/variance;
+
+                        end
+
+                        max_value = ...
+                            max(log_te_var(tap_no,:));
+
+                        temp_prob = ...
+                            exp(log_te_var(tap_no,:)-max_value);
+
+                        temp_sum = sum(temp_prob);
+
+                        if temp_sum > 0
+
+                            log_te_var(tap_no,:) = ...
+                                log(temp_prob/temp_sum);
+
+                        else
+
+                            log_te_var(tap_no,:) = ...
+                                log(ones(1,M_mod)/M_mod);
+
+                        end
+
+                    end
+
+                    %% ------------------------------------------------
+                    % Combine tap probabilities
+                    % -------------------------------------------------
+
+                    ln_qi = sum(log_te_var,1);
+
+                    ln_qi = ln_qi-max(ln_qi);
+
+                    prob_temp = exp(ln_qi);
+
+                    prob_sum = sum(prob_temp);
+
+                    if prob_sum > 0
+
+                        symbol_prob = ...
+                            prob_temp/prob_sum;
+
+                    else
+
+                        symbol_prob = ...
+                            ones(1,M_mod)/M_mod;
+
+                    end
+
+                    current_index = ...
+                        N*(ele1-1)+ele2;
+
+                    sum_prob_comp(current_index,:) = ...
+                        symbol_prob;
+
+                    %% ------------------------------------------------
+                    % Update message probabilities
+                    % -------------------------------------------------
+
+                    for tap_no = 1:taps
+
+                        eff_ele1 = dum_eff_ele1(tap_no);
+                        eff_ele2 = dum_eff_ele2(tap_no);
+
+                        ln_qi_loc = ...
+                            ln_qi-log_te_var(tap_no,:);
+
+                        ln_qi_loc = ...
+                            ln_qi_loc-max(ln_qi_loc);
+
+                        local_prob = exp(ln_qi_loc);
+
+                        local_sum = sum(local_prob);
+
+                        if local_sum > 0
+
+                            local_prob = ...
+                                local_prob/local_sum;
+
+                        else
+
+                            local_prob = ...
+                                ones(1,M_mod)/M_mod;
+
+                        end
+
+                        old_prob = reshape( ...
+                            p_map( ...
+                            N*(eff_ele1-1)+eff_ele2, ...
+                            tap_no,:), ...
+                            1,M_mod);
+
+                        new_prob = ...
+                            delta_fra*local_prob+ ...
+                            (1-delta_fra)*old_prob;
+
+                        new_prob = ...
+                            new_prob/sum(new_prob);
+
+                        p_map( ...
+                            N*(eff_ele1-1)+eff_ele2, ...
+                            tap_no,:) = ...
+                            reshape(new_prob,1,1,M_mod);
+
+                    end
+
+                end
+
+            end
+
+            %% ====================================================
+            % CONVERGENCE CHECK
+            % =====================================================
+
+            conv_rate = ...
+                sum( ...
+                max(sum_prob_comp,[],2)>0.99) ...
+                /(N*M);
+
+            if conv_rate == 1
+
+                sum_prob_fin = sum_prob_comp;
+                break;
+
+            elseif conv_rate > conv_rate_prev
+
+                conv_rate_prev = conv_rate;
+                sum_prob_fin = sum_prob_comp;
+
+            elseif ...
+                    conv_rate < conv_rate_prev-0.2 && ...
+                    conv_rate_prev > 0.95
+
+                break;
+
+            end
+
+        end
+
+        %% ========================================================
+        % SYMBOL ESTIMATION
+        % =========================================================
+
+        x_est = zeros(N,M);
+
+        for ele1 = 1:M
+
+            for ele2 = 1:N
+
+                current_index = ...
+                    N*(ele1-1)+ele2;
+
+                [~,pos] = max( ...
+                    sum_prob_fin(current_index,:));
+
+                x_est(ele2,ele1) = alphabet(pos);
+
+            end
+
+        end
+
+        %% ========================================================
+        % QAM DEMAPPING
+        % =========================================================
+
+        data_demapping = qamdemod( ...
+            x_est, ...
+            M_mod, ...
+            'gray');
+
+        % Convert symbols back to bits
+        data_info_est_matrix = de2bi( ...
+            data_demapping(:), ...
+            M_bits, ...
+            'left-msb');
+
+        data_info_est = ...
+            reshape( ...
+            data_info_est_matrix.', ...
+            [],1);
+
+        %% ========================================================
+        % BER ERROR COUNT
+        % =========================================================
+
+        errors = sum( ...
+            xor( ...
+            data_info_est, ...
+            data_info_bit));
+
+        err_ber(iesn0) = ...
+            err_ber(iesn0)+errors;
+
+    end
+
+end
+
+%% ================================================================
+% BER
+% ================================================================
+
+err_ber_fram = ...
+    err_ber/(N_bits_perfram*N_fram);
+
+%% ================================================================
+% BER FIGURE
+% ================================================================
+
+figure;
+
+semilogy( ...
+    SNR_dB, ...
+    err_ber_fram, ...
+    '-*', ...
+    'LineWidth',2);
+
+xlabel('SNR (dB)');
+ylabel('BER');
+title('OTFS BER Performance');
+
+grid on;
+
+%% ================================================================
+% TRANSMITTED DELAY-DOPPLER
+% ================================================================
+
+figure;
+
+surf( ...
+    0:M-1, ...
+    0:N-1, ...
+    tx_DD_plot, ...
+    'EdgeColor','none');
+
+xlabel('Delay Index');
+ylabel('Doppler Index');
+zlabel('|X_{DD}|');
+
+title('Transmitted Signal in Delay-Doppler Domain');
+
+view(45,35);
+grid on;
+colorbar;
+
+%% ================================================================
+% RECEIVED DELAY-DOPPLER
+% ================================================================
+
+figure;
+
+surf( ...
+    0:M-1, ...
+    0:N-1, ...
+    rx_DD_plot, ...
+    'EdgeColor','none');
+
+xlabel('Delay Index');
+ylabel('Doppler Index');
+zlabel('|Y_{DD}|');
+
+title('Received Signal in Delay-Doppler Domain');
+
+view(45,35);
+grid on;
+colorbar;
+
+%% ================================================================
+% TRANSMITTED TIME-FREQUENCY
+% ================================================================
+
+figure;
+
+surf( ...
+    0:M-1, ...
+    0:N-1, ...
+    tx_TF_plot, ...
+    'EdgeColor','none');
+
+xlabel('Subcarrier Index');
+ylabel('Time Slot');
+zlabel('|X_{TF}|');
+
+title('Transmitted Signal in Time-Frequency Domain');
+
+view(45,35);
+grid on;
+colorbar;
+
+%% ================================================================
+% RECEIVED TIME-FREQUENCY
+% ================================================================
+
+figure;
+
+surf( ...
+    0:M-1, ...
+    0:N-1, ...
+    rx_TF_plot, ...
+    'EdgeColor','none');
+
+xlabel('Subcarrier Index');
+ylabel('Time Slot');
+zlabel('|Y_{TF}|');
+
+title('Received Signal in Time-Frequency Domain');
+
+view(45,35);
+grid on;
+colorbar;
+
+%% ================================================================
+% CHANNEL INFORMATION
+% ================================================================
+
+fprintf('\n============================================\n');
+fprintf('OTFS SIMULATION COMPLETED\n');
+fprintf('============================================\n');
+
+fprintf('N = %d\n',N);
+fprintf('M = %d\n',M);
+fprintf('Channel paths = %d\n',taps);
+fprintf('Maximum delay = %d samples\n',max_delay);
+fprintf('Maximum Doppler bin = +/- %d\n',max_doppler_bin);
+fprintf('Sinc oversampling factor = %d\n',OSF);
+
+fprintf('\nChannel delays:\n');
+disp(channel_delay_plot.');
+
+fprintf('Channel Doppler bins:\n');
+disp(channel_doppler_plot.');
+
+fprintf('\nSNR(dB)             BER\n');
+
+for k = 1:length(SNR_dB)
+
+    fprintf( ...
+        '%5d          %.6e\n', ...
+        SNR_dB(k), ...
+        err_ber_fram(k));
+
+end
+
+toc;
+
+
+%% ================================================================
+% SINC INTERPOLATION FUNCTION
+% ================================================================
+
+function y = sinc_interpolate(x,OSF,half_width)
+
+    x = x(:);
+
+    L = length(x);
+
+    output_length = (L-1)*OSF+1;
+
+    y = zeros(output_length,1);
+
+    for k = 0:output_length-1
+
+        t = k/OSF;
+
+        center = floor(t);
+
+        left = max(0,center-half_width);
+        right = min(L-1,center+half_width);
+
+        index = left:right;
+
+        kernel = sinc(t-index);
+
+        y(k+1) = ...
+            sum(x(index+1).*kernel.');
+
+    end
+
+end
+
+
+%% ================================================================
+% SINC DECIMATION FUNCTION
+% ================================================================
+
+function y = sinc_decimate(x,OSF,half_width)
+
+    x = x(:);
+
+    L = length(x);
+
+    % Number of samples corresponding to original sampling grid
+    output_length = floor((L-1)/OSF)+1;
+
+    y = zeros(output_length,1);
+
+    for n = 0:output_length-1
+
+        center = n*OSF;
+
+        left = max(0,center-half_width*OSF);
+        right = min(L-1,center+half_width*OSF);
+
+        index = left:right;
+
+        t = (center-index)/OSF;
+
+        kernel = sinc(t);
+
+        y(n+1) = ...
+            sum(x(index+1).*kernel);
+
+    end
+
+end
