@@ -6,10 +6,7 @@ tic;
 
 %% ================================================================
 % PAPER-BASED OTFS TRANSCEIVER
-% Toolbox-free QAM, ISFFT, Heisenberg transform, multipath channel,
 % AWGN, TF demodulation, SFFT, BER and signal visualization.
-%
-% This is an uncoded, unequalized baseline implementation.
 %% ================================================================
 
 %% 1. SYSTEM PARAMETERS
@@ -406,8 +403,6 @@ fprintf('No fabricated OFDM comparison data is used.\n');
 
 toc;
 
-%% ================================================================
-% LOCAL FUNCTION: TOOLBOX-FREE GRAY-CODED QAM MAPPING
 %% ================================================================
 
 function symbols = qam_map(bits,Q)
